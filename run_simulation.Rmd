@@ -1,0 +1,1585 @@
+---
+title: "run analyses on simulated data"
+author: "William Reed Palmer"
+date: "CREATED: 3/14/2023 MODIFIED: 6/26/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#### SET CODE ROOT DIR (change code accordingly)
+root_dir <- "" # CODE DIR
+plot_dir <- paste0(root_dir, "/0_output/sim/plots/")
+setwd(root_dir)
+library(tidyverse)
+library(parallel)
+library(latex2exp)
+library(emulator, include.only = 'quad.form')
+library(gridExtra)
+library(Rfast)
+
+source("polynomial_fns.R")
+source("integrate_normal_fns.R")
+source("get_approx_h_fns.R")
+source("sim_model_fns.R")
+source("comp_var_approx_fns.R")
+source("samp_posterior_fns.R")
+source("post_processing_fns.R")
+source("post_pred_fns.R")
+```
+
+## set up simulation
+```{r}
+sigma_values <- c(.01, .02, .03, .04, .05)
+eta_values <- c(.025, .03, .035, .04)
+neg_zero_one_probs_rel <- c(1, 5, 2) # P(-) = 1/8, P(0) = 5/8, P(+) = 2/8
+```
+
+## Run simulation
+
+```{r}
+simSeed = 0
+set.seed(simSeed)
+
+### generate latent network
+n <- 20
+
+# draw from multinomial dist whether edge is negative, zero or positive
+draw_edges_sign_mat <- rmultinom(n ^ 2, size = 1, prob = neg_zero_one_probs_rel)
+edges_sign <- as.numeric(c(-1, 0, 1) %*% draw_edges_sign_mat)
+
+# set all non-zero edges to .1 with no variance in the edge weights
+# note the way the edges are generated is not at all exploited in the estimation (except to restict the estimates to (-.2, .2))
+# this restriction does make it easier to visualize fit, and visually assess the evolving estimation paths
+abs_mean_edge_weight <- .1
+edge_weight_sd <- 0
+edges <- edges_sign * rnorm(n ^ 2, abs_mean_edge_weight, edge_weight_sd)
+
+# construct adj matrix
+W_true <- matrix(
+  edges,
+  ncol = n
+) 
+diag(W_true) <- 0
+
+### set other model parameters
+eta_vec <- rep(c(.025, .03, .035, .04), 5)
+sigma_vec <- c(rep(.01, 4), rep(.02, 4), rep(.03, 4), rep(.04, 4), rep(.05, 4))
+delta <- .975
+K <- 50
+
+# SIMULATE SPIKE TRAINS ON NETWORK
+warmup_length <- 1000
+num_obs <- 105000 #52000
+
+# note this simulating function could be a lot more efficient
+sim_on_network <- runSimNetwork(
+  T_total = warmup_length + num_obs,
+  warmup = warmup_length,
+  W = W_true, V_init = runif(n, 0, .8),
+  sigma_vec = sigma_vec,
+  eta_vec = eta_vec,
+  delta = delta, K = K
+)
+
+sim_on_network$simSeed <- simSeed
+```
+
+## compute SNRs, output table describing nodes
+```{r}
+out_df <- 
+  lapply(seq_along(sim_on_network$outMatList),
+         function(k){
+           sim_on_network$outMatList[[k]] %>% as_tibble %>% mutate(node_i = k)
+         }) %>%
+  bind_rows()
+
+logliks_out <- 
+  lapply(
+    1:20,
+    function(i){
+      fit_F <- glm(y ~ V, family = binomial(link = "logit"), data = out_df %>% filter(node_i == i))
+      fit_1 <- glm(y ~ E_V_w_network, family = binomial(link = "logit"), data = out_df %>% filter(node_i == i))
+      fit_0 <- glm(y ~ E_V_no_network, family = binomial(link = "logit"), data = out_df %>% filter(node_i == i))
+      fit_NULL <- glm(y ~ intercept, family = binomial(link = "logit"), data = out_df %>% filter(node_i == i))
+      return(
+        tibble(
+          node_i = i,
+          lF = as.numeric(logLik(fit_F)),
+          l1 = as.numeric(logLik(fit_1)),
+          l0 = as.numeric(logLik(fit_0)),
+          lnull = as.numeric(logLik(fit_NULL))
+        )
+      )
+    }
+  )
+
+ll_f_vec <-
+  out_df %>%
+  mutate(
+    log_like_V = y * 50 * (V - 1) - f(V)
+  ) %>%
+  group_by(node_i) %>%
+  summarize(ll_f = sum(log_like_V)) %>%
+  pull(ll_f)
+
+SNR_df <- sim_on_network$spike_intervals %>%
+  filter(t_end <= 50000) %>%
+  group_by(i) %>%
+  summarize(T_max = as.integer(max(T_)), spikes = n()) %>%
+  mutate(
+    eta = eta_vec,
+    sigma = sigma_vec,
+    neg_in_edges = apply(W_true, 2, function(col) sum(col < 0)),
+    pos_in_edges = apply(W_true, 2, function(col) sum(col > 0)),
+    sum_in_edges = colSums(W_true)
+  ) %>%
+  bind_cols(
+    logliks_out %>%
+    bind_rows() %>%
+    mutate(
+      ll_f_vec = ll_f_vec,
+      SNR = (l1 - l0) / (-l1 + 1),
+      SNR_db = 10 * log(SNR, 10),
+      SNR_1 = (l1 - l0) / (ll_f_vec - l1 + 1),
+      SNR_db_1 = 10 * log(SNR_1, 10),
+      snr_reverse_rank = n - rank(SNR_db) + 1,
+      snr_rank_label = paste0("node ", snr_reverse_rank)
+    )
+  )
+
+snr_rev_rank_permutation = SNR_df$snr_reverse_rank
+
+### SUMMARY TABLE OF NODES IN SIMULATION
+SNR_df %>%
+  arrange(snr_reverse_rank) %>%
+  select(SNR_db, sigma, eta, pos_in_edges, neg_in_edges, sum_in_edges, spikes, T_max) %>%
+  view()
+
+SNR_df %>%
+  arrange(snr_reverse_rank) %>%
+  select(SNR_db, sigma, eta, pos_in_edges, neg_in_edges, sum_in_edges, spikes, T_max) %>%
+  xtable::xtable(digits = c(1,2,2,3,1,1,1,0,0))
+
+```
+
+## Fit variational approximation
+## specify training length, call r script "run_sim_fit.R"
+```{r}
+## WARNING -- Long runtime -- try running just one `T_train_cutoff' to start (ie T_train_cutoff <- 10000)
+### CREATE FILE DIR SYSTEM:
+# root_dir + "/0_output/sim/0_fits/"
+if (FALSE) {
+  num_epochs_run <- 50
+  minibatch_count <- 16
+  for(T_train_cutoff in c(1000, 5000, 10000, 25000, 50000)){
+    source(paste0(root_dir, "/run_sim_fit.R"), local = environment())
+  }
+  
+  1+1
+}
+```
+
+## load saved fits
+```{r}
+# load saved runs
+### UPDATE FILENAMES
+runLists_filepath <- paste0(root_dir, "/0_output/sim/0_fits/")
+
+runList_1000 <- readRDS(paste(runLists_filepath, "runList_sim_1000_20230418175947.RData", sep = "/"))
+runList_5000 <- readRDS(paste(runLists_filepath, "runList_sim_5000_20230418184651.RData", sep = "/"))
+runList_10000 <- readRDS(paste(runLists_filepath, "runList_sim_10000_20230415000319.RData", sep = "/"))
+runList_25000 <- readRDS(paste(runLists_filepath, "runList_sim_25000_20230414232859.RData", sep = "/"))
+runList_50000 <- readRDS(paste(runLists_filepath, "runList_sim_50000_20230414210255.RData", sep = "/"))
+
+runLists = list("train_1k" = runList_1000, "train_5k" = runList_5000, "train_10k" = runList_10000, "train_25k" = runList_25000, "train_50k" = runList_50000)
+```
+
+
+#load df with updates / estimates
+
+```{r}
+W_paths <- lapply(
+  runLists,
+  function(runList){
+    get_W_paths_df(runList, run_name = paste(runList$fit_params$T_train_cutoff), sim = TRUE)
+  } %>%
+    mutate(epochs_run = runList$adam_update$epochs)
+) %>%
+  bind_rows()
+
+W_est_1k <- get_W_est(runList_1000)
+W_est_5k <- get_W_est(runList_5000)
+W_est_10k <- get_W_est(runList_10000)
+W_est_25k <- get_W_est(runList_25000)
+W_est_50k <- get_W_est(runList_50000)
+
+# non-W parameters
+params_updates_df <- lapply(
+  runLists,
+  function(runList){
+    get_non_W_param_updates_df(runList, run_name = paste(runList$fit_params$T_train_cutoff), sim = TRUE)
+  }
+) %>%
+  bind_rows()
+```
+
+# look at final network estimages
+```{r}
+W_true <- runList_10000$model_params$W_true
+mat_list <- list("hat(W)~~'for'~~T==5*k" = W_est_5k, "hat(W)~~'for'~~T==10*k" = W_est_10k, "hat(W)~~'for'~~T==25*k" = W_est_25k, "hat(W)~~'for'~~T==50*k" = W_est_50k, "'ground truth'~W" = W_true)
+mat_list_diffs <- list("T==1*k" = W_est_1k - W_true, "hat(W) - W~~'for'~~T==5*k" = W_est_5k - W_true, "hat(W) - W~~'for'~~T==10*k" = W_est_10k - W_true, "hat(W) - W~~'for'~~T==25*k" = W_est_25k - W_true, "hat(W) - W~~'for'~~T==50*k" = W_est_50k - W_true)
+#mat_list_diffs <- list("10k" = W_est_10k - W_true, "25k" = W_est_25k - W_true, "50k" = W_est_50k - W_true)
+
+p_sim_HM <- getHeatMaps_side_by_side(
+  mat_list = mat_list,
+  title = "Compare estimates with different training cutoffs",
+  black_white = F,
+  facet_wrap_rows = 1,
+  indices = snr_rev_rank_permutation,
+  scale_fill_breaks = c(-.1,0,.1)
+) +
+  theme(
+    axis.text.x = element_blank(),
+    #axis.text.y = element_text(size = 6),
+    axis.text.y = element_blank()
+  ) +
+  labs(
+    title = TeX(r'(Network estimates $\hat{\bf{W}}$ and differences $\hat{\bf{W}} - \bf{W}$ from increasing training sets)'),
+    fill = "edge\nweight",
+    y = "node index"
+  )
+
+p_sim_DIFF <- getHeatMaps_side_by_side(
+  mat_list = mat_list_diffs[2:5],
+  black_white = F,
+  facet_wrap_rows = 1,
+  indices = snr_rev_rank_permutation,
+  annotate_signs_mat = W_true
+) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank()
+    #axis.text.y = element_text(size = 6)
+  ) +
+  labs(
+    #title = TeX(r'(Differences $\hat{\bf{W}} - $\bf{W}$)'),
+    title = "",
+    fill = "difference",
+    y = "node index"
+  )
+
+gg <- grid.arrange(
+  grobs = list(
+    p_sim_HM + theme(plot.margin = margin(0, 0, 0, 0, "cm")),
+    p_sim_DIFF + theme(plot.margin = margin(0, .2, 0, 0, "cm")) + geom_text(mapping = aes(label = labelx), color="black", size = 2)
+  ),
+  nrow = 2,
+  heights = c(1, 1),
+  #widths = c(1,.05, 1.05)#,
+  #bottom = grid::textGrob("epoch",
+  #  #gp = gpar(fontsize = 9),
+  #  hjust = .5,
+  #  vjust = 0
+  #)
+  #top = "Measures by node, fit to simulated data with T = 50k"
+)
+
+ggsave(paste0(plot_dir, "W_estimates_sim_w_diff.pdf"), gg, width = 7.5, height = 3.7)
+```
+# Look at simulated v_star values vs fit under variational approx q
+```{r}
+runList <- runList_50000
+
+density_plot_range <- c(.6,1.3)
+density_plot_x <- seq(from = density_plot_range[1], to = density_plot_range[2], by = .005)
+
+vartheta_out_vec <- runList_50000$adam_update$values_out$phi["vartheta", ]
+tau_out_vec <- runList_50000$adam_update$values_out$phi["tau", ]
+
+plot_density_df <-
+  lapply(
+    1:runList$model_params$n,
+    function(node_i){
+      vartheta <- vartheta_out_vec[node_i] %>% unname
+      tau <- tau_out_vec[node_i] %>% unname
+      tibble(
+        node = factor(node_i, levels = snr_rev_rank_permutation, labels = paste("node", 1:20)),
+        V_star = density_plot_x,
+        dnorm_fit =dnorm(density_plot_x, mean = vartheta, sd = tau)
+      )
+    }
+  ) %>% bind_rows()
+
+
+# look at spiking voltages
+sim_spikes_df <- lapply(
+  1:runList$model_params$n,
+  function(node_i){
+    outMat <- runList$model_params$sim$outMatList[[node_i]][1:50000,]
+    outMat %>%
+      as_tibble %>%
+      filter(y==1 & spike_count > 0) %>%
+      select(t, spike_count, V, t_ws, xb, z) %>%
+      rename(V_spike = V) %>%
+      left_join(
+        outMat %>%
+          as_tibble %>%
+          mutate(t = t + 1) %>%
+          select(t, V) %>%
+          rename(V_prev = V),
+        by = "t",
+      ) %>%
+      #rowwise() %>%
+      mutate(node = node_i)
+      #mutate(node = snr_rev_rank_permutation[node_i])
+  }
+) %>%
+  bind_rows %>%
+  mutate(
+    V_star = (V_prev + V_spike) / 2,
+    V_star_scale = as.numeric(scale(V_star))
+  )
+
+sum_sim_df_spike <-
+  sim_spikes_df %>%
+  group_by(node) %>%
+  summarize(
+    V_star_mean = mean(V_star),
+    V_star_sd = sd(V_star),
+    nspikes = n()
+  ) %>%
+  rowwise() %>%
+  mutate(node = snr_rev_rank_permutation[node])
+
+
+#ceiling(.03 * 50) / 50
+
+plot_x_lb <- floor(min(sim_spikes_df$V_star) * 50) / 50
+plot_x_ub <- ceiling(max(sim_spikes_df$V_star) * 50) / 50
+
+p_v_star <-
+  sim_spikes_df %>%
+  mutate(node = factor(node, levels = snr_rev_rank_permutation, labels = paste("node", 1:20)), legend_fill = "") %>%
+  #group_by(node) %>%
+  ggplot(mapping = aes(x = V_star)) +
+  geom_histogram(
+    breaks = seq(from = plot_x_lb, to = plot_x_ub, by = .02),
+    mapping = aes(y = after_stat(density), fill = legend_fill),
+    #fill="cornflowerblue",
+    color = "blue"
+  ) +
+  geom_line(
+    data = plot_density_df %>%
+      filter(V_star >= plot_x_lb & V_star <= plot_x_ub) %>%
+      mutate(legend_label = ""),
+    mapping = aes(x = V_star, y = dnorm_fit, color = legend_label),
+    #color = "darkgoldenrod1",
+    linewidth = 1
+  ) +
+  scale_color_manual(values = "darkgoldenrod1") +
+  scale_fill_manual(values = "cornflowerblue") +
+  scale_x_continuous(limits = c(plot_x_lb, plot_x_ub), expand = c(0,0)) +
+  facet_wrap(~node, nrow = 3) +
+  theme_bw() +
+  theme(
+    legend.position = c(.9,.1),
+    legend.direction="vertical",
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    axis.text.y = element_blank(),
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = TeX(r'(Histograms of $v_{i,k}^*$ values from simulation with their estimated densities under $q_{\phi | \Y}$)'),
+    subtitle =  TeX(r'(midpoints between spiking voltages $v_{i,t^i_k}$ and voltages one step before $v_{i,t^i_k - 1}$)'),
+    x = TeX(r'($v_{i,k}^* = (v_{i,t^i_k - 1} + v_{i,t^i_k})/2$)'),
+    color = TeX(r'($N(\vartheta_i, \tau_i)$)'),
+    fill = TeX(r'($v_{i,k}^*$ sim)'),
+    y = "density by node"
+  ) #+
+  #geom_text(
+  #  data =
+  #    tibble(
+  #      node_i = rep(snr_rev_rank_permutation, 3),
+  #      x = rep(plot_x_lb + .02, 60),
+  #      y = rep(max(plot_density_df$dnorm_fit), 20) %>% c(. - 3, . - 6),
+  #      label = c(paste0("vartheta[", snr_rev_rank_permutation, "] == ",
+  #                       str_sub(paste(round(vartheta_out_vec,3)), start = 2)), 
+  #                paste0("tau[", snr_rev_rank_permutation, "] == ",
+  #                       str_sub(paste(round(tau_out_vec,3)), start = 2)),
+  #                paste0("n == ", sum_sim_df_spike$nspikes))
+  #    ) %>%
+  #    mutate(
+  #      node = factor(node_i, levels = 1:20, labels = paste("node", 1:20))
+  #    ),
+  #  mapping = aes(x=x, y=y, label=label),
+  #  parse = TRUE,
+  #  vjust = "inward", hjust = "inward",
+  #  size = 3.5
+  #)
+
+p_v_star <- p_v_star +
+  theme(
+    legend.position = c(.93,.07),
+    legend.key.height = unit(3, 'mm'),
+    legend.key.width = unit(5, 'mm'),
+    legend.title = element_text(size=8),
+    legend.box.background = element_rect(colour = "black"),
+    #legend.text = element_text(size=8),
+    #legend.key.height = unit(3, 'mm'),
+    plot.subtitle = element_blank(),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "cm")
+  ) +
+  labs(
+    title = TeX(r'($v_{i,k}^*$ values from simulation with their estimated densities under $q_{\phi | \Y}$)'),
+    x = TeX(r'($v_{i,k}^* = (v_{i,t^i_k - 1} + v_{i,t^i_k})/2$)'),
+    color = TeX(r'($N(\vartheta_i, \tau_i)$)'),
+    fill = TeX(r'($v_{i,k}^*$ sim)'),
+    y = "density by node"
+  )
+
+ggsave(paste0(plot_dir, "p_v_star_50k.pdf"), p_v_star, width = 7, height = 3.5)
+
+```
+
+
+
+```{r}
+CUR_CUTOFF <- 50000
+CUR_CUTOFF_LAB <- "50k"
+y_limit <- .2
+
+#### plot with network estimates
+p_W_paths <- W_paths %>%
+  filter(run_name == paste(CUR_CUTOFF)) %>%
+  rowwise() %>%
+  mutate(
+    source_node = factor(source_node, levels = 1:n),
+    #target_node = factor(target_node, levels = 1:n, labels = paste("node", 1:n, "in-edges")),
+    epoch = step - 1,
+    true_edge = factor(sign(Wij_true), levels = c(-1, 0, 1), labels = c("-.1", "0", ".1")),
+    facet_node_label = factor(paste("node", snr_rev_rank_permutation[target_node], "in-edges"), levels = paste("node", 1:n, "in-edges"))
+    #facet_node_label_old = factor(target_node, levels = snr_rev_rank_permutation, labels = paste("node", 1:n, "in-edges")) # this reorders the nodes accourding to snr
+  ) %>%
+  ungroup() %>%
+  ggplot(mapping = aes(
+    x = epoch, y = Wij_est, group = source_node,
+    color = true_edge
+    )) +
+  geom_abline(intercept = .1, slope = 0, color = "red", linetype = "dashed", linewidth = .5, alpha = .4) +
+  geom_abline(intercept = -.1, slope = 0, color = "blue", linetype = "dashed", linewidth = .5, alpha = .4) +
+  geom_line(alpha = .7) +
+  facet_wrap(~facet_node_label, nrow = 3) +
+  scale_color_manual(values = c("blue", "grey", "red")) +
+  theme_bw() +
+  theme(
+    legend.position = c(.94, .13),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.direction="vertical",
+    plot.margin = margin(0, .2, 0, 0, "cm"),
+    legend.box.background = element_rect(colour = "black")
+  ) +
+  scale_y_continuous(limits = c(-y_limit, y_limit)) +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(0,0)) +
+  labs(#title = "(a) Network edge estimates, each subplot corresponds to column in W",
+       title = TeX(r'((a) Network estimates $\hat{\bf{w}}_{\rightarrow i}^{(1)},...,\hat{\bf{w}}_{\rightarrow i}^{(50)}$, each subplot estimates a column $\bf{w}_{\rightarrow i}$ in $\bf{W}$)'),
+       x = "epoch", y = "estimate",
+       color = "true value")
+
+p_W_paths +
+  labs(title = paste("Edge estimates based on simulation with training cutoff at", CUR_CUTOFF_LAB),
+       subtitle = TeX(r'(Each subplot shows a column $\bf{w}_{\rightarrow i}$ of $\bf{W}$)'))
+
+
+## to save alone for slides... will combine with others for paper
+#ggsave("evolving_network_est")
+
+```
+
+## look at variables
+
+```{r}
+
+variational_params <- c("vartheta", "tau", "nu1", "nu2", "beta1", "beta2")
+variational_param_labels <- c("vartheta", "tau", "nu[1]", "nu[2]", "beta[1]", "beta[2]")
+
+p_variational_paths <-
+  params_updates_df %>%
+  filter(run_name == paste(CUR_CUTOFF) & variable %in% variational_params) %>%
+  mutate(
+    node_i = factor(node_i, levels = 1:n),
+    variable = factor(variable, levels = variational_params, labels = variational_param_labels)
+  ) %>%
+  ggplot(mapping = aes(x=step, y=value, color = as.character(node_i)
+                       #group = as.character(node_i)
+                       )) +
+  geom_line(alpha = .8) +
+  facet_wrap(~variable, scales="free", ncol = 2, labeller = label_parsed) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title=element_text(hjust=0.5),
+    strip.text = element_text(size = 12)
+  ) +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(0,0)) +
+  labs(
+    title = "(b) Variational param estimates (colored by node)",
+    x = "",
+    y = "parameter estimate"
+  )
+
+# include longer title for slides...
+p_variational_paths +
+  labs(
+    title = paste("Variational parameter estimates based on simulation with training cutoff at", CUR_CUTOFF_LAB),
+    x = "epoch",
+    y = "parameter estimate"
+  )
+
+y_axis_breaks = c(0, sigma_values, .1)
+y_axis_labels = c("0.00", "0.01", "0.02", "0.03", "0.04", "0.05", "0.10")
+y_axis_cols = c("black", "deeppink1", "limegreen", "darkorchid1", "darkgoldenrod1", "cornflowerblue", "black")
+
+p_sigma_paths <-
+  params_updates_df %>%
+  filter(run_name == paste(CUR_CUTOFF) & variable == "sigma") %>%
+  mutate(
+    node_i = factor(node_i, levels = 1:n),
+    truth = factor(true_value,
+               levels = sigma_values)
+  ) %>%
+  ggplot(mapping = aes(x=step, y=value, color = truth, group = node_i)) +
+  scale_color_manual(values = c("deeppink1", "limegreen", "darkorchid1", "darkgoldenrod1", "cornflowerblue")) +
+  geom_line(alpha = .8) +
+  theme_bw() +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(0,0)) +
+  #scale_y_continuous(limits = c(0,.2), expand = c(0,0)) +
+  scale_y_continuous(breaks = y_axis_breaks, labels = y_axis_labels,
+                     limits = c(0,.15), expand = c(0,0)) +
+  labs(
+    title = TeX(r'((c) $\hat{\sigma}_1^{(k)},...,\hat{\sigma}_{20}^{(k)}$ estimates)'),
+    x = "",
+    y = "",
+    color = TeX(r'(true $\sigma_i$ values)')
+  ) +
+  theme(
+    legend.position = c(.46, .7),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.direction="vertical",
+    #plot.margin = margin(0, .2, 0, 0, "cm"),
+    legend.box.background = element_rect(color = "black"),
+    axis.text.y = element_text(colour = y_axis_cols),
+    panel.grid.minor.y = element_blank()
+  )
+
+p_sigma_paths
+
+
+y_axis_breaks = c(-.02, 0, eta_values)
+y_axis_labels = c("-.02", " 0.0", ".025", ".030", ".035", ".040")
+y_axis_cols = c("black", "black", "dodgerblue", "orange", "green", "mediumvioletred")
+
+p_eta_paths <-
+  params_updates_df %>%
+  filter(run_name == paste(CUR_CUTOFF) & variable == "eta") %>%
+  mutate(
+    node_i = factor(node_i, levels = 1:n),
+    truth = factor(true_value,
+               levels = eta_values)
+  ) %>%
+  ggplot(mapping = aes(x=step, y=value, color = truth, group = node_i)) +
+  scale_color_manual(values = c("dodgerblue", "orange", "green", "mediumvioletred")) +
+  geom_line(alpha = .8) +
+  theme_bw() +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(0,0)) +
+  scale_y_continuous(
+    #breaks = c(-.02, 0, .02, .04) , labels =c("-.02", "0.00", "0.02", "0.04"), limits = c(-.024, .041)
+    breaks = y_axis_breaks , labels = y_axis_labels, limits = c(-.024, .045)
+  ) +
+  labs(
+    #title = "(d) eta estimates",
+    title = TeX(r'((d) $\hat{\eta}_1^{(k)},...,\hat{\eta}_{20}^{(k)}$ estimates)'),
+    x = "",
+    y = "",
+    color = TeX(r'(true $\eta_i$ values)')
+  ) +
+  theme(
+    legend.position = c(.46, .3),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.direction="vertical",
+    #plot.margin = margin(0, .2, 0, 0, "cm"),
+    legend.box.background = element_rect(color = "black"),
+    axis.text.y = element_text(colour = y_axis_cols)
+  )
+
+p_eta_paths
+
+```
+## time to put some plots together
+```{r}
+
+layout_matrix = rbind(c(1, 1), c(2, 3), c(2, 4))
+
+
+gg <- grid.arrange(
+  grobs = list(p_W_paths + xlab(""),
+               p_variational_paths + theme(plot.margin = margin(0, .2, 0, 0, "cm")),
+               p_sigma_paths + theme(plot.margin = margin(0, .2, 0, 0, "cm")) + 
+                 theme(
+                   legend.title = element_text(size=10),
+                   legend.text = element_text(size=8),
+                   legend.key.height = unit(3, 'mm'),
+                   legend.key.width = unit(5, 'mm')
+                 ),
+               p_eta_paths + theme(plot.margin = margin(0, .2, 0, 0, "cm")) +
+                 theme(
+                   legend.title = element_text(size=10),
+                   legend.text = element_text(size=8),
+                   legend.key.height = unit(3, 'mm'),
+                   legend.key.width = unit(5, 'mm')
+                 )
+               ),
+  layout_matrix = layout_matrix,
+  widths = c(1.4, 1),
+  heights = c(1.5, .75, .75),
+  bottom = grid::textGrob("epoch",
+    #gp = gpar(fontsize = 9),
+    hjust = .5,
+    vjust = 0
+  )
+)
+
+ggsave(paste0(plot_dir, "evolving_estimates_50k.pdf"), gg, width = 8.25, height = 10)
+
+
+
+```
+
+```{r}
+epochs_run <- vapply(runLists, function(rl) rl$adam_update$epochs, 0)
+
+measure_df_sim <- 
+  params_updates_df %>%
+  filter(variable %in% c("sigma", "eta")) %>%
+  group_by(run_name, step, variable) %>%
+  summarize(value = sum(sqrd_error)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(
+    run_ind = which(run_name == paste(c(1,5,10,25,50) * 1000)),
+    measure = paste(variable, "sqrd_error", sep = "_"),
+    epoch = step * (50 / epochs_run[run_ind]),
+  ) %>%
+  ungroup() %>%
+  select(-c(step, variable)) %>%
+  bind_rows(
+    lapply(runLists,
+           function(runList){
+             N_ints <- length(runList$fit_params$train_indices)
+             n_epochs <- runList$adam_update$epochs
+             tibble(
+               value = c(runList$adam_update$obj_epoch_train) / runList$fit_params$T_train_cutoff,
+               epoch = (0:n_epochs) * (50 / n_epochs),
+               measure = "approx ELBO", #(ave over training period intervals)
+               run_name = paste(runList$fit_params$T_train_cutoff)
+             )
+           }) %>%
+      bind_rows()
+  ) %>%
+  bind_rows(
+    W_paths %>%
+      group_by(run_name, step) %>%
+      summarize(value = sum(sqrd_error)) %>%
+      ungroup() %>%
+      rowwise() %>%
+      mutate(
+        measure = "sqrd_error_W",
+        run_ind = which(run_name == paste(c(1,5,10,25,50) * 1000)),
+        epoch = (step - 1) * (50 / epochs_run[run_ind]),
+      ) %>%
+      select(-step)
+  )
+
+p_eval <- measure_df_sim %>%
+  filter(run_name != "1000" & epoch > 2) %>%
+  mutate(
+    run_name = factor(run_name,
+                      levels = c(1, 5, 10, 25, 50) * 1000,
+                      labels = c("T=1k", "T=5k", "T=10k", "T=25k", "T=50k")),
+    measure = factor(measure, levels = c("approx ELBO", "sqrd_error_W", "sigma_sqrd_error", "eta_sqrd_error"),
+                     labels = c('"(a) Variational objective"',
+                                '"(b)"~sum((hat(W)[ij] - W[ij])^2, list(i,j)==1, n)',
+                                "'(c)'~sum((hat(sigma[i]) - sigma[i])^2, i==1, n)",
+                                "'(d)'~sum((hat(eta[i]) - eta[i])^2, i==1, n)"))
+  ) %>%
+  #filter(epoch > 5) %>%
+  ggplot(mapping = aes(x = epoch, y = value, color = run_name)) +
+  geom_line(alpha = 1) +
+  facet_wrap(~measure, scales = "free_y", labeller = label_parsed, nrow = 1) +
+  labs(
+    x = "epoch",
+    title = TeX(r'(Evaluating $(\hat{theta}, \hat{\textbf{W}}, \hat{phi})$ updates by epoch and training size)'),
+    #title = "measures",
+    y = "",
+    color = "training\nlength"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    #axis.text.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #panel.grid.major.y = element_blank(),
+    #panel.grid.minor = element_blank()
+  ) +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(0,0)) +
+  scale_color_manual(values=c("deeppink1", "limegreen", "darkgoldenrod1", "firebrick1", "dodgerblue")[-1]) +
+  geom_point(
+    data = tibble(
+       measure = factor(c("approx ELBO", "sqrd_error_W", "sigma_sqrd_error", "eta_sqrd_error"),
+                        levels = c("approx ELBO", "sqrd_error_W", "sigma_sqrd_error", "eta_sqrd_error"),
+                     labels = c('"(a) Variational objective"',
+                                '"(b)"~sum((hat(W)[ij] - W[ij])^2, list(i,j)==1, n)',
+                                "'(c)'~sum((hat(sigma[i]) - sigma[i])^2, i==1, n)",
+                                "'(d)'~sum((hat(eta[i]) - eta[i])^2, i==1, n)")),
+       x = c(0,0,0,0),
+       y = c(-31.3,0,0,0)
+    ),
+       size = .1,
+       color = "white",
+       mapping = aes(x=x, y=y),
+       inherit.aes = F
+  )
+
+p_eval
+
+ggsave(
+  paste0(plot_dir, "eval_5K_10k_25k_50k.pdf"),
+  p_eval +
+    theme(
+       legend.position = c(.4,.65),
+       legend.title = element_text(size=10),
+       legend.text = element_text(size=8),
+       legend.key.height = unit(4, 'mm'),
+       legend.key.width = unit(5, 'mm'),
+       plot.margin = margin(t = 0, r = .2, b = 0, l = 0, unit = "cm"),
+       legend.box.background = element_rect(colour = "black")
+    ),
+  width = 8, height = 3)
+
+```
+
+## diagnosising convergence and fit by node
+
+# get PSIS values for each node
+```{r}
+runList <- runList_50000
+n_sims_q <- 1000
+cl <- makeCluster(12, type="FORK")
+psis_out_list <- 
+  parLapply(
+    cl,
+    1:n,
+    function(node_i){
+      node_i_intervals <- runList$fit_params$spike_intervals_df_train %>% filter(i == node_i)
+      interval_sampling_df_PSIS <-
+        lapply(
+          seq_along(node_i_intervals$index),
+          function(k){
+            cur_interval_index <- node_i_intervals[k, "index", drop = TRUE]
+            print(paste(k, "of", nrow(node_i_intervals)))
+            
+            interval_out <- 
+              eval_interval_sampling(
+                cur_interval_index,
+                runList,
+                n_sims_q = n_sims_q,
+                get_AR_samples = F,
+                sim = TRUE,
+                return_samples = F,
+                draw_from_q0 = F,
+                #empirical_KL = F,
+                get_truth = F,
+                only_for_PSIS_calc = T
+              )
+            
+            pareto_k_interval <-
+              loo::psis(
+                log_ratios = interval_out[, "log_joint_Z_sim_z"] - interval_out[, "log_q_Z_sim_q"],
+                r_eff = NA
+              )$diagnostics$pareto_k
+            
+            interval_out %>%
+              as_tibble() %>%
+              add_column(
+                sim_index = 1:n_sims_q,
+                cur_interval_index = cur_interval_index,
+                i = node_i,
+                T_ = node_i_intervals[k, "T_", drop = TRUE],
+                pareto_k_interval = pareto_k_interval,
+                .before = 1
+              )
+          }
+        ) %>%
+        bind_rows()
+      
+      return(
+        list(
+          pareto_k_node = 
+            interval_sampling_df_PSIS %>%
+            group_by(sim_index) %>%
+            summarize(
+              log_q_Z_sim_q = sum(log_q_Z_sim_q), log_joint_Z_sim_z = sum(log_joint_Z_sim_z),
+            ) %>%
+            mutate(
+              log_ratios = log_joint_Z_sim_z - log_q_Z_sim_q
+            ) %>%
+            pull(log_ratios) %>%
+            loo::psis(r_eff = NA) %>%
+            magrittr::extract2("diagnostics") %>%
+            magrittr::extract2("pareto_k"),
+          intervals_w_pareto_k =
+            interval_sampling_df_PSIS %>%
+            filter(sim_index == 1) %>%
+            select(cur_interval_index, i, T_, pareto_k_interval)
+        )
+      )
+    }
+  )
+stopCluster(cl)
+
+legend_labels = TeX(c("$\\hat{k} < .5$ ",
+                      "$\\hat{k} \\in [.5,.7]$",
+                      "$\\hat{k} > .7$"))
+
+p_k_hat <- lapply(psis_out_list, "[[", "intervals_w_pareto_k") %>%
+  bind_rows() %>%
+  rowwise() %>%
+  mutate(
+    node_i =  snr_rev_rank_permutation[i],
+    #node = factor(i, levels = snr_rev_rank_permutation, labels = paste0("node ", 1:20))
+    node = factor(node_i, levels = 1:20, labels = paste0("node ", 1:20))
+  ) %>%
+  ggplot(mapping = aes(x = pareto_k_interval)) +
+  geom_rect(
+    data = tibble(
+      xmin = c(-.35, .5, .7),
+      xmax = c(.5, .7, 5),
+      ymin = 0,
+      ymax = 4.2,
+      fill = factor(c("g", "y", "r"), levels = c("g", "y", "r"))
+    ),
+    inherit.aes = F,
+    mapping = aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
+    alpha = .3
+  ) +
+  scale_fill_manual(values = c("green", "yellow", "red"), labels = unname(legend_labels)) +
+  geom_histogram(breaks = seq(-.35, 5, by = .05),
+                 mapping = aes(y = after_stat(density)),
+                 fill = "black") +
+  facet_wrap(~node) +
+  #geom_vline(xintercept = .5, color = "green", linetype = "dashed") +
+  #geom_vline(xintercept = .7, color = "red", linetype = "dashed") +
+  theme_bw() +
+  theme(
+    plot.title=element_text(hjust=0.5),
+    legend.position = c(.93,.1),
+    legend.title = element_blank(),
+    legend.key.width = unit(4, 'mm'),
+    legend.text = element_text(size=7),
+    plot.subtitle=element_text(hjust=0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = TeX(r'(Pareto Smoothed Importance Sampling (PSIS) diagnostic)'),
+    color = "measure",
+    x = TeX(r'($\hat{k}$ values by observed inter-spike interval)'),
+    y = "density by node",
+  ) +
+  #geom_text(
+  #  data =
+  #    tibble(
+  #      node = factor(snr_rev_rank_permutation, levels = 1:20, paste0("node ", 1:20)),
+  #      x = rep(4.1, 20),
+  #      y = rep(4, 20),
+  #      label = paste0("hat(k) == ",
+  #                     paste(round(unlist(lapply(psis_out_list, "[[", "pareto_k_node")),1))),
+  #    ),
+  #  mapping = aes(x=x, y=y, label=label),
+  #  parse = TRUE,
+  #  vjust = "inward", hjust = "inward",
+  #  size = 3.5
+  #) +
+  scale_x_continuous(expand = c(0,0), breaks = c(0,1,2,3,4,5), labels = c(" 0", "1", "2", "3", "4", "5 "), limits = c(-.35,5)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.2))
+  
+
+p_k_hat <- p_k_hat + facet_wrap(~node, nrow = 3) + coord_fixed(.8) + theme(plot.margin = margin(0, .1, 0, 0, "cm"))
+  
+  
+#coord_fixed(.8)
+
+#sigma <- runList_50000$adam_update$values_out$phi["sigma",]
+#tau <- runList_50000$adam_update$values_out$phi["tau",]
+#sigma / tau
+
+ggsave(paste0(plot_dir, "PSIS.pdf"), p_k_hat, width = 7.5, height = 3.65)
+```
+
+### just get obj by node
+```{r}
+
+spike_intervals_df_w_obj <-
+  runList$fit_params$spike_intervals_df_train %>%
+  add_column(
+    setNames(
+      as_tibble(runList$adam_update$epoch_objs_mat),
+      paste0("epoch_", 0:50)
+    )
+  )
+
+node_spikes_obj_sum <-
+  spike_intervals_df_w_obj %>%
+  group_by(i) %>%
+  summarize(across(starts_with("epoch"), sum))
+
+p_elbo_by_node <- node_spikes_obj_sum %>%
+  rowwise() %>%
+  mutate(
+    node_i =  snr_rev_rank_permutation[i],
+    node = factor(node_i, levels = 1:20, labels = paste0("node ", 1:20))
+  ) %>%
+  pivot_longer(cols = 2:52, names_to = "epoch_str", values_to = "approx_ELBO") %>%
+  mutate(
+    epoch = as.numeric(factor(epoch_str, levels = paste0("epoch_", 0:50))) - 1,
+    #variable = "approx ELBO\n(scaled)"
+  ) %>%
+  #filter(epoch > 0)
+  ggplot(mapping = aes(x = epoch, y = approx_ELBO)) +
+  geom_line(color = "blue") +
+  theme_bw() +
+  theme(
+    legend.position = c(.4,.6),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(t = 0, r = .1, b = 0, l = 0, unit = "cm")
+  ) +
+  scale_y_continuous(expand = c(.1,.1)) +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50  "), expand = c(.025,.025)) +
+  facet_wrap(~node, scales = "free", nrow = 3) +
+  labs(
+    title = "Variational objective by epoch and node",
+    y = "ELBO (approximate)",
+    x = "epoch"
+  )
+
+ggsave(paste0(plot_dir, "elbo_by_node.pdf"), p_elbo_by_node, width = 7.5, height = 3.2)
+
+```
+
+# first get objs by node / epoch / interval
+```{r}
+runList <- runList_50000
+
+### calculate initial obj on all the data (without calculating any gradients)
+### should have done this in initial run....
+if (FALSE) {
+  runList <- runList_50000
+  epoch_objs_mat <- matrix(NA, nrow = length(runList$fit_params$train_indices), ncol = 51)
+  cl <- makeCluster(15, type="FORK")
+  startTime <- Sys.time()
+  for (cur_epoch in 0:50){
+    storeTime <- Sys.time()
+    cat("running on epoch ", cur_epoch, " of ", 50, "\n", sep = "")
+    clusterExport(cl, "cur_epoch")
+    epoch_objs_mat[, cur_epoch + 1] <-
+      par_obj_grad_spikes(
+        cl = cl,
+        interval_indices = runList$fit_params$train_indices,
+        input_list = runList$adam_update$values_epoch[[cur_epoch + 1]],
+        spike_intervals_df = runList$fit_params$spike_intervals_df_train,
+        binary_spike_train_mat = runList$fit_params$binary_spike_mat_train,
+        delta = runList$model_params$delta,
+        K = runList$model_params$K, piecewise_approx_list=piecewise_approx_list,
+        grads = FALSE,
+        sort_on_T = FALSE,
+        retListObjs = TRUE
+      ) %>% unname()
+    print(Sys.time() - storeTime)
+    print(Sys.time() - startTime)
+  }
+  stopCluster(cl)
+  
+  saveRDS(
+    epoch_objs_mat,
+    file=paste0(runLists_filepath, "epoch_objs_mat_50000.RData")
+  ) 
+}
+
+#epoch_objs_mat <- readRDS(paste0(runLists_filepath, "epoch_objs_mat_50000.RData"))
+```
+
+# vis aprox elbo along with sqrd error measures by node and epoch
+```{r}
+spike_intervals_df_w_obj <-
+  runList$fit_params$spike_intervals_df_train %>%
+  add_column(
+    setNames(
+      as_tibble(runList$adam_update$epoch_objs_mat),
+      paste0("epoch_", 0:50)
+    )
+  )
+
+node_spikes_obj_sum <-
+  spike_intervals_df_w_obj %>%
+  group_by(i) %>%
+  summarize(across(starts_with("epoch"), sum))
+  
+node_spikes_obj_sum$minObj <- data.frame.to_matrix(node_spikes_obj_sum)[, -1] %>% rowMins(value = TRUE)
+node_spikes_obj_sum$maxObj <- data.frame.to_matrix(node_spikes_obj_sum)[, -1] %>% rowMaxs(value = TRUE)
+
+elbo_scale_down <- .04
+y_limit <- .042
+
+
+p_epoch_measures_by_node <-
+  params_updates_df %>%
+  filter(run_name == "50000" & variable %in% c("sigma", "eta")) %>%
+  mutate(
+    rel_sq_error = sqrd_error / true_value,
+    variable = paste0(variable, " rel\nsqrd error")
+  ) %>%
+  rename(epoch = step) %>%
+  group_by(node_i, epoch, variable) %>%
+  summarize(value = sum(rel_sq_error)) %>%
+  bind_rows(
+    W_paths %>%
+      filter(run_name == "50000") %>%
+      rename(node_i = target_node, epoch = step) %>%
+      group_by(node_i, epoch) %>%
+      summarize(value = sum(sqrd_error)) %>%
+      mutate(variable = "in-edges\nsqrd error", epoch = epoch - 1),
+    node_spikes_obj_sum %>%
+      rename(node_i = i) %>%
+      pivot_longer(cols = 2:52, names_to = "epoch_str", values_to = "approx_ELBO") %>%
+      mutate(
+        epoch = as.numeric(factor(epoch_str, levels = paste0("epoch_", 0:50))) - 1,
+        value = elbo_scale_down *(approx_ELBO - minObj)/(maxObj - minObj),
+        variable = "approx ELBO\n(scaled)"
+      )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    value = ifelse(value > y_limit, y_limit, value),
+    variable = factor(variable, levels = c("approx ELBO\n(scaled)", "in-edges\nsqrd error",
+                                           "sigma rel\nsqrd error", "eta rel\nsqrd error")),
+    i = snr_rev_rank_permutation[node_i],
+    #i = node_i,
+    node_i = factor(i, levels = 1:20, labels = paste("node", 1:20))
+  ) %>%
+  #filter(epoch > 10) %>%
+  ggplot(mapping = aes(x=epoch, y = value, color = variable)) +
+  scale_y_continuous(limits = c(-.002, y_limit), expand = c(0,0), breaks = 0, labels = "0") +
+  scale_x_continuous(breaks = c(0, 25, 50), labels =c(" 0", "25", "50   "), expand = c(0,0)) +
+  geom_line() +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    #axis.text.y = element_blank(),
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Evolving measures by node, fit to simulated data with T = 50k",
+    color = "", #"measure",
+    x = "epoch",
+    y = ""
+  ) +
+  scale_color_manual(
+    values = c("black", "green", "red", "blue"),
+    labels = unname(TeX(c("approx\nELBO\n(scaled)",
+                          "$\\| \\hat{\\bf{w}}_{\\rightarrow i} - \\bf{w}_{\\rightarrow i} \\|^2$",
+                          "$\\frac{(\\hat{\\sigma_i} - \\sigma_i) ^2}{\\sigma_i}$",
+                          "$\\frac{(\\hat{\\eta_i} - \\eta_i) ^2}{\\eta_i}$")))
+  ) +
+  facet_wrap(~node_i)
+
+
+  p_epoch_measures_by_node +
+    labs(title = "(a)Scaled approx ELBO and squared errors") +
+    facet_wrap(~node_i, ncol = 5) +
+    theme(
+      legend.position = "right"
+    ) +
+    coord_fixed(50/y_limit)
+  
+```
+## put 2 plots together
+```{r}
+p_legend <- g_legend(p_epoch_measures_by_node + theme(legend.position = "bottom"))
+
+
+layout_matrix = rbind(c(1, 2, 2), c(3, 3, NA))
+
+
+gg <- grid.arrange(
+  grobs = list(p_epoch_measures_by_node +
+                labs(title = "(a) Scaled approx ELBO and squared errors") +
+                facet_wrap(~node_i, ncol = 5) +
+                theme(legend.position = "none", plot.margin = margin(0, .05, .15, 0, "cm")) +
+                coord_fixed(50/y_limit),
+               #p_variational_paths + theme(plot.margin = margin(0, .2, 0, 0, "cm")),
+               p_k_hat + facet_wrap(~node, ncol = 4) + coord_fixed(.8) +
+                 labs(y = "", title = "(b) PSIS diagnoistic") +
+                 theme(plot.margin = margin(0, 0, 0, 0, "cm")),
+               p_legend
+              ),
+  layout_matrix = layout_matrix,
+  heights = c(1, .1),
+  widths = c(1,.05, 1.05)#,
+  #bottom = grid::textGrob("epoch",
+  #  #gp = gpar(fontsize = 9),
+  #  hjust = .5,
+  #  vjust = 0
+  #)
+  #top = "Measures by node, fit to simulated data with T = 50k"
+)
+
+ggsave(paste0(plot_dir, "measures_by_node_50k.pdf"), gg, width = 8.25, height = 5)
+
+```
+
+```{r}
+training_intervals_df_w_psis_out <-
+  lapply(
+    psis_out_list,
+    function(list_){
+      list_$intervals_w_pareto_k %>%
+        mutate(k = row_number()) %>%
+        rename(index = cur_interval_index)
+    }
+  ) %>%
+  bind_rows() %>%
+  arrange(index)
+
+
+
+## pretty nice!
+5396 # lowest k hat
+
+327 # LARGEST k hat wow
+
+14791 # also interesting!
+
+# lowest k
+set.seed(0)
+plots_5396 <- get_plots(5396, training_intervals_df_w_psis_out[5396,], scale = .5, snr_rev_rank = snr_rev_rank_permutation)
+plots_5396[[1]] <- plots_5396[[1]] + labs(y = "(a) density of Mahalanobis distances") +
+  scale_x_continuous(expand = c(0,0),
+                       breaks = c(0, 25, 50, 75),
+                       labels = c("0", "25", "50", "75"))
+
+# middle k, outlier
+#plots_14781 <- get_plots(14781, training_intervals_df_w_psis_out[14781,])
+# low k
+set.seed(0)
+plots_18832 <- get_plots(18832, training_intervals_df_w_psis_out[18832,], scale = 1, snr_rev_rank = snr_rev_rank_permutation)
+plots_18832[[1]] <- plots_18832[[1]] +
+  scale_x_continuous(expand = c(.01,.01),
+                       breaks = c(0, 75, 150),
+                       labels = c("0", "75", "150 "), limits = c(0, 160))
+# highest k
+set.seed(0) 
+plots_9961 <- get_plots(9961, training_intervals_df_w_psis_out[9961,], scale = 2, snr_rev_rank = snr_rev_rank_permutation)
+plots_9961[[1]] <- plots_9961[[1]] + scale_x_continuous(expand = c(.01,.01),
+                       breaks = c(0, 50, 100, 150),
+                       labels = c("0", "50", "100", "150"), limits = c(0, 125))
+ 
+
+plots_18832[[2]] <- plots_18832[[2]] + labs(y = "")
+plots_18832[[3]] <- plots_18832[[3]] + labs(y = "", x = "t (within interspike interval)")
+plots_9961[[2]] <- plots_9961[[2]] + labs(y = "")
+plots_9961[[3]] <- plots_9961[[3]] + labs(y = "")
+# high k, outlier for q
+
+
+layout_matrix = rbind(c(1, 4, 7), c(2, 5, 8),  c(3, 6, 9))
+
+
+gg <- grid.arrange(
+  grobs = c(plots_5396, plots_18832, plots_9961),
+  layout_matrix = layout_matrix,
+  heights = c(1, 1.1, 1),
+  widths = c(1, 1, 1),
+  #bottom = grid::textGrob("epoch",
+  #  #gp = gpar(fontsize = 9),
+  #  hjust = .5,
+  #  vjust = 0
+  #)
+  #top = TeX(r'(Comparing $q_{\hat{\phi}}(z)$ to draws from $p_{\hat{\theta},\hat{\bf{W}}}(z|y)$)')
+  top =
+    grid::textGrob(
+      expression(Comparing~q[hat(phi)]*(z)~to~draws~from~p[list(hat(theta),hat(W))]*(z~"|"~Y)~and~the~true~simulated~data~on~three~training~intervals),
+                   hjust=.5)
+)
+
+ggsave(paste0(plot_dir, "interval_samples.pdf"), gg, width = 8.75, height = 8)
+
+```
+
+
+## Get Posterior Predictions
+# broken down into multiple steps
+# do this in separate file now... "RUN_pp_SIM.R"
+
+```{r}
+setwd("/Users/williamreedpalmer/Documents/Columbia/Research/inferring network VI/R code")
+
+
+```
+
+```{r}
+
+
+#runList <- runList_50000
+#T_train_cutoff <- runList$fit_params$T_train_cutoff
+
+#pp_dir <- paste0(root_dir, "/0_output/sim/3_pp/", runList$fit_params$T_train_cutoff)
+#list.files(pp_dir)
+
+pattern <- paste0("pp_[0-9]{1,2}_Apr15.*")
+post_pred_out_df_all <-
+  lapply(
+    runLists,
+    function(runList){
+      T_train_cutoff <- runList$fit_params$T_train_cutoff
+      pp_dir <- paste0(root_dir, "/0_output/sim/3_pp/", T_train_cutoff)
+      lapply(
+        str_extract(list.files(pp_dir), pattern),
+        function(filename){
+          if(!is.na(filename)){
+            pp_df <- readRDS(paste0(pp_dir, "/", filename)) %>%
+              mutate(filename = filename, date = str_sub(filename,-14,-7), T_train = T_train_cutoff)
+            
+            cur_held_out_node <- pp_df[1, "held_out_node", drop = T]
+            start_t <- pp_df[1, "t", drop = T]
+            end_t <- tail(pp_df, 1)[1, "t", drop = T]
+            
+            pp_df %>%
+              mutate(
+                true_V = runList$model_params$sim$outMatList[[cur_held_out_node]][start_t:end_t, "V"],
+                true_p = gtools::inv.logit(50 * (true_V - 1))
+              )
+          }
+        }
+      ) %>% bind_rows()
+    }
+  ) %>% bind_rows()
+
+
+raw_names <- c("true_p", "pp_scaled_sim", "p_NA", "bs_prob", "frwrd_sim", "pp_sim")
+est_labels <- c("true event\nprobability", "forward backward\nestimate",
+                  "non-anticipating\nestimate", "bootstrap\nestimate",
+                                "forward\nprobability", "est_scale")
+filter_labels_no_split <- c("true spike probability", "forward backward estimate",
+                  "non-anticipating estimate", "bootstrap estimate", "est_scale")
+
+filter_labels <- est_labels[c(1:4, 6)]
+label_colors <- setNames(c("firebrick1", "dodgerblue", "darkgoldenrod1", "limegreen", "deeppink1"), filter_labels)
+label_colors_no_split <- setNames(label_colors, filter_labels_no_split)
+
+sims_out_df_long <-
+  post_pred_out_df_all %>%
+  select(-r_max, -epsilon_1) %>%
+  pivot_longer(cols = c("bs_prob", "p_NA",
+                        "pp_sim", "pp_scaled_sim",
+                        "frwrd_sim", "true_p"), names_to = "measure") %>%
+  mutate(
+    value = ifelse(value == 0, 1e-100, value),
+    cross_entropy_loss = -1 * (held_out_truth * log(value) + (1 - held_out_truth) * log(1 - value)),
+    prob_label = factor(measure, levels = raw_names, labels = est_labels)
+  )
+  
+
+post_pred_out_df_all %>%
+  group_by(held_out_node, T_train) %>%
+  summarize(
+    actual_observed_spikes = sum(held_out_truth),
+    NA_spikes = sum(p_NA),
+    PP_spikes = sum(pp_sim),
+    PP_fwrd_spikes = sum(frwrd_sim),
+    BS_spikes = sum(bs_prob)
+  ) %>% view()
+
+##post_pred_out_df %>%
+##  mutate(
+#    diff = pp_scale - non_anticipating_probs,
+#    diff_sq = diff ^ 2
+#  ) %>%
+#  group_by(held_out_node, date) %>%
+#  summarize(ave_sq_diff = mean(diff_sq), max_sq_diff = max(diff_sq), whichMax = which.max(diff_sq))
+  
+  #score_diffs_pivot_longer[which.max(score_diffs_pivot_longer$cross_entropy_loss),]
+
+```
+
+```{r}
+#ranks <- lapply(psis_out_list, "[[", "pareto_k_node") %>% unlist() %>% rank()
+#as.numeric(names(setNames(ranks, 1:n) %>% sort()))
+
+#label_colors = setNames(c("dodgerblue", "darkgoldenrod1", "grey", "firebrick1"), filter_labels)
+
+p_CE_loss <- sims_out_df_long %>%
+  filter(prob_label %in% filter_labels) %>%
+  #filter(value > 0) %>%
+  #mutate(held_out_node = factor(as.character(held_out_node), levels = paste(1:runList$model_params$n))) %>%
+  group_by(held_out_node, T_train, prob_label) %>%
+  summarize(cross_entropy_loss = sum(cross_entropy_loss)) %>%
+  mutate(
+    training_size = factor(T_train, levels = c(10,25,50) * 1000,
+                           labels = paste0("Training length T=", c(10,25,50),"k"))
+  ) %>%
+  #mutate(node_rank = factor(held_out_node, levels = as.numeric(names(setNames(ranks, 1:n) %>% sort())))) %>% 
+  ggplot(mapping = aes(x = held_out_node, y = cross_entropy_loss, color = prob_label)) +
+  geom_point(shape = 18) +
+  geom_line() +
+  facet_wrap(~training_size, nrow = 2) +
+  scale_x_continuous(breaks = 1:20, labels = paste0(1:20), expand = c(.01,0)) +
+  theme_bw() +
+  theme(
+    legend.position = c(.75,.24),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.box.background = element_rect(color = "black"),
+    #axis.text.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_blank()
+  ) +
+  labs(
+    y = "cross entropy loss",
+    x = "held-out node",
+    title = "Performance of estimated spike probabilities",
+    subtitle = "by held-out node and training set length"
+  ) +
+  scale_color_manual(values = label_colors)
+```
+
+```{r}
+
+ce_summary_df <- sims_out_df_long %>%
+  filter(
+    prob_label %in% filter_labels[1:4] &
+      T_train > 5000
+  ) %>%
+  #filter(value > 0) %>%
+  #mutate(held_out_node = factor(as.character(held_out_node), levels = paste(1:runList$model_params$n))) %>%
+  group_by(held_out_node, T_train, prob_label) %>%
+  summarize(cross_entropy_loss = sum(cross_entropy_loss))
+
+ce_ratios_nodes <- 
+  ce_summary_df %>%
+  left_join(
+    ce_summary_df %>%
+      filter(prob_label == "true spike\nprobability") %>%
+      select(held_out_node, T_train, cross_entropy_loss) %>%
+      rename(true_prob_ce = cross_entropy_loss),
+    by = c("held_out_node", "T_train")
+  ) %>%
+  mutate(
+    training_size = factor(T_train, levels = c(10,25,50) * 1000,
+                           labels = paste0("Training length T=", c(10,25,50),"k")) %>% as.numeric(),
+    ce_ratio = cross_entropy_loss / true_prob_ce
+  )
+
+label_colors <- setNames(c("firebrick1", "black", "blue", "deeppink1", "black"), filter_labels)
+filter_labels <- est_labels[c(1:4, 6)]
+
+#scale_color_discrete(labels = unname(TeX(c("$A_{t-k}^h$", "$B_{t-k}^h$"))))
+legend_labels = TeX(c("$logit^{-1}\\kappa(v-1)$",
+                      "forward backward $\\hat{p}$",
+                      "non-anticipating $\\tilde{p}^{na}$",
+                      "simple bootstrap $\\hat{f}{}^B$", "est"))
+
+
+
+p_CE_loss <- ce_ratios_nodes %>%
+  group_by(training_size, prob_label) %>%
+  summarize(ce_ratio = sum(cross_entropy_loss) / sum(true_prob_ce)) %>%
+  filter(prob_label != "true spike\nprobability") %>%
+  #mutate(node_rank = factor(held_out_node, levels = as.numeric(names(setNames(ranks, 1:n) %>% sort())))) %>% 
+  ggplot(mapping = aes(x = training_size, y = ce_ratio, color = prob_label)) +
+  geom_rect(
+    inherit.aes = F,
+    xmin = 1.5, xmax = 2.5, ymin = 0, ymax = 8,
+    fill = "lightgrey", alpha = .5
+  ) +
+  geom_point(shape = 18, size = 4) +
+  geom_line(linewidth = 1) +
+  geom_label(
+    data = ce_ratios_nodes %>%
+      filter(prob_label != "true spike\nprobability") %>%
+      rowwise() %>%
+      mutate(
+        held_out_node = snr_rev_rank_permutation[held_out_node],
+        pos = training_size + (held_out_node - 10.5) / 25 + sign(held_out_node - 10.5) * .06
+      ),
+    mapping =  aes(x = pos, y = ce_ratio, color = prob_label, label = held_out_node),
+    size = 3
+    #position = position_jitter(width = .25, height = 0)
+  ) +
+  #facet_wrap(~held_out_node, nrow = 4) +
+  #scale_x_continuous(breaks = 1:20, labels = paste0(1:20), expand = c(.01,0)) +
+  theme_bw() +
+  theme(
+    legend.position = c(.8,.8),
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    legend.box.background = element_rect(color = "black"),
+    #axis.text.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()#,
+    #legend.title = element_blank()
+  ) +
+  labs(
+    #y = "ratio of cross entropy loss with estimate to loss with true probability",
+    title = TeX(r'(Evaluating estimates $\hat{\bf{f}}_r$ for held-out probabilities $Pr(Y_{r,i}^{test} = 1 | Y^{train}, Y^{test}_{-i})$)'),
+    #subtitle = TeX(r'(relative to true probabilities $\bf{p}^{true}_r = logit^{-1}\kappa(v_r-1)$)'),
+    #subtitle = "based on cross entropy loss relative to
+    y = TeX(r'(relative loss  $L^{CE}(\Y^{test}_{i^*}, \hat{\bf{f}})$ / $L^{CE}(\Y^{test}_{i^*}, \bf{p}^{true})$)'),
+    #y = "cross entropy w estimated probability / cross entropy w true probability",
+    x = "training data length",
+    #title = "Performance of estimated spike probabilities relative to true spike probabilities",
+    #subtitle = "by held-out node and training set length"
+    color = "estimate"
+  ) +
+  scale_color_manual(values = label_colors, labels = unname(legend_labels[2:4])) +
+  scale_x_continuous(breaks = 1:3, labels = paste0("T=", c(10,25,50),"k"), expand = c(0,0), limits = c(.5,3.5)) +
+  scale_y_continuous(expand = c(.02,.02))
+
+
+
+ggsave(paste0(plot_dir, "pp_ce_loss_NEW.pdf"), p_CE_loss, width = 7, height = 4)
+
+ce_ratios_nodes %>%
+  ungroup() %>%
+  filter(prob_label != "true spike\nprobability") %>%
+  group_by(T_train, held_out_node) %>%
+  summarize(min_est = which.min(cross_entropy_loss)) %>%
+  group_by(min_est) %>%
+  summarize(counts = n())
+
+ce_ratios_nodes %>%
+  ungroup() %>%
+  filter(prob_label != "true spike\nprobability") %>%
+  group_by(T_train, held_out_node) %>%
+  filter(cross_entropy_loss == min(cross_entropy_loss)) %>%
+  group_by(prob_label, T_train) %>% 
+  summarize(count = n())
+  
+
+
+```
+
+
+```{r}
+which(snr_rev_rank_permutation==19)
+
+indicesToPlot <- 1230:1520
+#indicesToPlot <- 1730:2020
+#indicesToPlot <- 0:2200
+plotNodes <- c(2,3,13,20)
+plotNodes_reorder = snr_rev_rank_permutation[plotNodes]
+
+T_train_plot <- 50000
+p <- sims_out_df_long %>%
+  filter(r %in% indicesToPlot & held_out_node %in% plotNodes & prob_label %in% filter_labels[c(1,2,3,4)] &
+           T_train == T_train_plot) %>%
+  mutate(held_out_node = factor(held_out_node, levels = plotNodes, labels = paste0("node ", plotNodes_reorder))) %>%
+  ggplot(mapping = aes(x = r, y = value, color = prob_label)) +
+    geom_vline(
+    #inherit.aes = F,
+    data = sims_out_df_long %>%
+      filter(
+        held_out_node %in% plotNodes & prob_label %in% filter_labels[c(1,2,3,4)] &
+          T_train == T_train_plot &
+          held_out_truth == 1 & r %in% indicesToPlot
+      ) %>%
+      mutate(
+        y = 0,
+        held_out_node = factor(held_out_node, levels = plotNodes, labels = paste0("node ", plotNodes_reorder))
+      ),
+    mapping = aes(xintercept = r),
+    #mapping=aes(x=r,y=y),
+    #shape = 4,
+    #size = 2,
+    color = "limegreen",
+    linetype = "dotted"
+  ) +
+  #geom_point(mapping = aes(y= cross_entropy_loss / 5, color = measure), alpha=.5) +
+  geom_line() +
+  #scale_linetype_manual(values = c("estimates" = "solid", "non-anticipating" = "dotted","bootstrap baseline" = "solid")) +
+  scale_color_manual(values = label_colors) +
+  #scale_alpha_manual(values = c("est sim unscaled" = 1, #"forward probs" = .9,
+  #                              "non-anticipating" = .8,"bootstrap baseline" = .8)) +
+  geom_text(
+    data = 
+      sims_out_df_long %>%
+        filter(r %in% indicesToPlot & held_out_node %in% plotNodes &
+                 prob_label %in% filter_labels[c(1,2,3,4)] & T_train == T_train_plot) %>%
+        group_by(held_out_node, prob_label) %>%
+        summarize(cross_entropy_loss = sum(cross_entropy_loss)) %>%
+        mutate(
+          label = paste0("loss=", sprintf("%.1f", cross_entropy_loss)),
+          x = min(indicesToPlot) + 65, y = .85,
+          held_out_node = factor(held_out_node, levels = plotNodes, labels = paste0("node ", plotNodes_reorder))
+        ),
+    mapping = aes(x=x, y=y, label=label),
+    color = "black",
+    hjust = "inward", vjust = "inward"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title=element_text(hjust=0.5),
+    plot.subtitle=element_text(hjust=0.5),
+    #axis.text.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  #facet_wrap(~prob_label, ncol = 1) +
+  #labeller = label_parsed
+  facet_grid(prob_label~held_out_node) +
+  labs(
+    title = "Comparing true spike probabilities from simulated data with estimates",
+    subtitle = "for four held-out nodes across section of test period",
+    x = "testing period observation index",
+    y = "event probability",
+    color = ""
+  ) +
+  scale_x_continuous(expand = c(0,0), breaks = c(1250, 1375, 1500), labels = c("\t\t1250", "1375", "1500\t\t"))
+
+p
+
+ggsave(paste0(plot_dir, "pp_3sections_50k.pdf"), p, width = 8, height = 5.5)
+
+
+```
+
