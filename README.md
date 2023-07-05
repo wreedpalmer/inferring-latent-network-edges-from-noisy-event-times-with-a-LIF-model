@@ -65,11 +65,11 @@ where $\mathcal{X}$ is the indexed set of observed inter-event periods in $\math
 
 The full details of this variational approximation are in sections 3.3.2 and 3.3.3 of my dissertation. The details for computing the approximation are given in sections 3.3.4 and 3.3.5.
 
-
-
 # Applications
 
 I apply these methods in a simulation study and to real neural recording data. The details of these applictions are in sections 3.4 and 3.5 of my dissertation. Here are a few figures showing the key results of these applications.
+
+![Alt text](/plots/computation.png?raw=true "computation")
 
 # Code overview
 
