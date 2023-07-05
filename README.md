@@ -1,7 +1,7 @@
 # inferring-latent-network-edges-from-noisy-event-times-with-a-LIF-model
 code for dissertation chapter three and paper in progress
 
-see paper:: [link when available]
+see chapter 3: [(https://doi.org/10.7916/tfdh-kt07)]
 
 run_simulation.Rmd creates simulated data from data model (eq. xx), contains code to create figures for publication
 
