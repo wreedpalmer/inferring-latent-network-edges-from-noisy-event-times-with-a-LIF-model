@@ -3,6 +3,8 @@ code for dissertation chapter three and paper in progress
 
 see chapter 3: https://doi.org/10.7916/tfdh-kt07
 
+![Alt text](/plots/diagram.jpg?raw=true "Optional Title")
+
 run_simulation.Rmd creates simulated data from data model (eq. xx), contains code to create figures for publication
 
 Running run_sim_fit.R (from run_simulation.Rmd) computes variational approximation.
