@@ -67,15 +67,45 @@ The full details of this variational approximation are in sections 3.3.2 and 3.3
 
 # Applications
 
-I apply these methods in a simulation study and to real neural recording data. The details of these applictions are in sections 3.4 and 3.5 of my dissertation. Here are a few figures showing the key results of these applications.
+I apply these methods in a simulation study and to real neural recording data. Perform the following steps in each application to compute the variational approximation:
 
-![Alt text](/plots/computation.png?raw=true "computation")
+![Alt text](/plots/computation2.png?raw=true "computation")
+
+The details of these applications are in sections 3.4 and 3.5 of my dissertation. Here are a selected figures showing key results:
+
+## Simulation study - comparing estimated adjacency matrix with known ground truth
+
+![Alt text](/plots/Figure4.png?raw=true "Figure4")
+
+## Simulation study - evaluating updates by epoch
+
+![Alt text](/plots/Figure5.png?raw=true "Figure5")
+
+## Simulation study - evolving estimates
+
+![Alt text](/plots/Figure6.png?raw=true "Figure6")
+
+## Simulation study - comparing the computed variational approximation to the posterior predictive distribution and simulated ground truth fluctuations
+
+![Alt text](/plots/Figure11.png?raw=true "Figure11")
+
+## Simulation study - predictive event probability estimates
+
+![Alt text](/plots/Figure13.png?raw=true "Figure13")
+
+## Real data application - neural recording data from dorsomedial frontal cortex (DMFC) of a rhesus macaque
+
+![Alt text](/plots/Figure14.png?raw=true "Figure14")
+
+## Real data application - main network inference results
+
+![Alt text](/plots/Figure15.png?raw=true "Figure15")
 
 # Code overview
 
-* run_simulation.Rmd creates simulated data from data model (eq. xx), contains code to create figures for publication
+* run_simulation.Rmd creates simulated data from the considered data model, contains code to create figures for publication
 
-* Running run_sim_fit.R (from run_simulation.Rmd) computes variational approximation.
+* Running run_sim_fit.R (from run_simulation.Rmd) computes the variational approximation
 
 * Make posterior predictions for held-out individual nodes on test set with RUN_post_pred_SIM.R 
 
