@@ -7,11 +7,11 @@ In our model-based approach, we consider a generative process incorporating late
 This approach allows for fully interpretable inference of both the model parameters of interest and the variational parameters. Moreover, it is computationally efficient in scenarios when the observed event times are not too sparse.
 We apply our methods in a simulation study and to recorded neural activity in the dorsomedial frontal cortex (DMFC) of a rhesus macaque. We assess our results based on ground truth, model diagnostics, and spike prediction for held-out nodes.
 
-$$
-x \mapsto f(x)
-$$
+# Generative model for discrete event times
 
-![Alt text](/plots/diagram.jpg?raw=true "Optional Title")
+The data generating process is a generalized state-space model for multivariate time series of binary count data. Here is a diagram of the model:
+
+![Alt text](/plots/diagram.jpg?raw=true "Model Diagram")
 
 run_simulation.Rmd creates simulated data from data model (eq. xx), contains code to create figures for publication
 
