@@ -71,7 +71,7 @@ I apply these methods in a simulation study and to real neural recording data. P
 
 ![Alt text](/plots/computation2.png?raw=true "computation")
 
-The details of these applications are in sections 3.4 and 3.5 of my dissertation. Here are a selected figures showing key results:
+The details of these applications are in sections 3.4 and 3.5 of my dissertation. Here are selected figures showing key results:
 
 ## Simulation study - comparing estimated adjacency matrix with known ground truth
 
